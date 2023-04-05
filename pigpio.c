@@ -1871,6 +1871,7 @@ static int myDoCommand(uintptr_t *p, unsigned bufSize, char *buf)
    int masked;
    res = 0;
 
+   DBG(DBG_USER, "cmd=%d", p[0]);
    switch (p[0])
    {
       case PI_CMD_BC1:
@@ -7748,9 +7749,50 @@ static int initAllocDMAMem(void)
 
 /* ----------------------------------------------------------------------- */
 
+#define SAVED_CLK_NUMBER 5
+
+typedef struct {
+	int pwm_state_saved;
+	int pwm_ctl;
+	int pwm_sta;
+	int pwm_rng1;
+	int pwm_dmac;
+
+	int pcm_state_saved;
+	int pcm_cs;
+	int pcm_fifo;
+	int pcm_mode;
+	int pcm_rxc;
+	int pcm_txc;
+	int pcm_dreq;
+	int pcm_inten;
+	int pcm_intstc;
+	int pcm_gray;
+
+	struct {
+	   int state_saved;
+	   int ctl_addr;
+	   int div_addr;
+	   int ctl;
+	   int div;
+	} clk[SAVED_CLK_NUMBER];
+} state_t;
+
+static state_t state;
+
 static void initPWM(unsigned bits)
 {
    DBG(DBG_STARTUP, "bits=%d", bits);
+
+   if (!state.pwm_state_saved)
+   {
+      DBG(DBG_USER, "Save PWM state");
+      state.pwm_ctl = pwmReg[PWM_CTL];
+      state.pwm_sta = pwmReg[PWM_STA];
+      state.pwm_rng1 = pwmReg[PWM_RNG1];
+      state.pwm_dmac = pwmReg[PWM_DMAC];
+      state.pwm_state_saved = 1;
+   }
 
    /* reset PWM */
 
@@ -7791,9 +7833,74 @@ static void initPWM(unsigned bits)
 
 /* ----------------------------------------------------------------------- */
 
+static void restoreState(void)
+{
+   DBG(DBG_USER, "Restore state");
+   if (state.pwm_state_saved)
+   {
+      DBG(DBG_USER, "Restore PWM state");
+      pwmReg[PWM_CTL] = 0; // Reset
+      pwmReg[PWM_STA] = state.pwm_sta;
+      pwmReg[PWM_RNG1] = state.pwm_rng1;
+      pwmReg[PWM_DMAC] = state.pwm_dmac;
+      pwmReg[PWM_CTL] = PWM_CTL_CLRF1; // Clear FIFO
+      pwmReg[PWM_CTL] = state.pwm_ctl;
+   }
+
+   if (state.pcm_state_saved)
+   {
+      DBG(DBG_USER, "Restore PCM state");
+      pcmReg[PCM_CS] = 0; // Disable to modify
+      pcmReg[PCM_FIFO] = state.pcm_fifo;
+      pcmReg[PCM_MODE] = state.pcm_mode;
+      pcmReg[PCM_RXC] = state.pcm_rxc;
+      pcmReg[PCM_TXC] = state.pcm_txc;
+      pcmReg[PCM_DREQ] = state.pcm_dreq;
+      pcmReg[PCM_INTEN] = state.pcm_inten;
+      pcmReg[PCM_INTSTC] = state.pcm_intstc;
+      pcmReg[PCM_GRAY] = state.pcm_gray;
+      pcmReg[PCM_CS] = state.pcm_cs; // Enable original state
+   }
+
+   for (int clock = 0; clock < SAVED_CLK_NUMBER; clock++)
+      if (state.clk[clock].state_saved)
+      {
+	 DBG(DBG_USER, "Restore clock %d state", clock);
+	 clkReg[state.clk[clock].div_addr] = (BCM_PASSWD | state.clk[clock].div);
+
+	 usleep(10);
+
+	 clkReg[state.clk[clock].ctl_addr] = (BCM_PASSWD | state.clk[clock].ctl);
+
+	 usleep(10);
+
+	 clkReg[state.clk[clock].ctl_addr] |= (BCM_PASSWD | CLK_CTL_ENAB);
+      }
+
+   waveClockInited = 0;
+   PWMClockInited = 0;
+}
+
+/* ----------------------------------------------------------------------- */
+
 static void initPCM(unsigned bits)
 {
    DBG(DBG_STARTUP, "bits=%d", bits);
+
+   if (!state.pcm_state_saved)
+   {
+      DBG(DBG_USER, "Save PCM state");
+      state.pcm_fifo = pcmReg[PCM_FIFO];
+      state.pcm_mode = pcmReg[PCM_MODE];
+      state.pcm_rxc = pcmReg[PCM_RXC];
+      state.pcm_txc = pcmReg[PCM_TXC];
+      state.pcm_dreq = pcmReg[PCM_DREQ];
+      state.pcm_inten = pcmReg[PCM_INTEN];
+      state.pcm_intstc = pcmReg[PCM_INTSTC];
+      state.pcm_gray = pcmReg[PCM_GRAY];
+      state.pcm_cs = pcmReg[PCM_CS];
+      state.pcm_state_saved = 1;
+   }
 
    /* disable PCM so we can modify the regs */
 
@@ -7843,11 +7950,38 @@ static void initPCM(unsigned bits)
 
 /* ----------------------------------------------------------------------- */
 
+static int getClkIndex(int clkCtl)
+{
+   switch (clkCtl)
+   {
+      case CLK_GP0_CTL: return 0;
+      case CLK_GP1_CTL: return 1;
+      case CLK_GP2_CTL: return 2;
+      case CLK_PWMCTL: return 3;
+      case CLK_PCMCTL: return 4;
+   }
+   return 0;
+}
+
+/* ----------------------------------------------------------------------- */
+
 static void initHWClk
    (int clkCtl, int clkDiv, int clkSrc, int divI, int divF, int MASH)
 {
    DBG(DBG_INTERNAL, "ctl=%d div=%d src=%d /I=%d /f=%d M=%d",
       clkCtl, clkDiv, clkSrc, divI, divF, MASH);
+
+   int clock = getClkIndex(clkCtl);
+   if (!state.clk[clock].state_saved)
+   {
+      DBG(DBG_USER, "Save clock %d state", clock);
+      state.clk[clock].ctl_addr = clkCtl;
+      state.clk[clock].div_addr = clkDiv;
+      // Keep MASH, FLIP, and SRC
+      state.clk[clock].ctl = (clkReg[clkCtl] & 0b11100001111);
+      state.clk[clock].div = clkReg[clkDiv];
+      state.clk[clock].state_saved = 1;
+   }
 
    /* kill the clock if busy, anything else isn't reliable */
 
@@ -8767,6 +8901,7 @@ void gpioTerminate(void)
    }
 
 #endif
+   restoreState();
    initReleaseResources();
 
    fflush(NULL);
@@ -12262,6 +12397,7 @@ int gpioNotifyClose(unsigned handle)
       /* actual close done in alert thread */
    }
 
+   restoreState();
    return 0;
 }
 
